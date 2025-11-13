@@ -324,3 +324,25 @@ func nodeReplace2Kid(new BNode, old BNode, idx uint16, ptr uint64, key []byte) {
 	nodeAppendKV(new, idx, ptr, key, nil)
 	nodeAppendRange(new, old, idx+1, idx+2, old.nkeys()-(idx+2))
 }
+
+// GetRoot returns the root pointer
+func (tree *BTree) GetRoot() uint64 {
+	return tree.root
+}
+
+// SetRoot sets the root pointer
+func (tree *BTree) SetRoot(root uint64) {
+	tree.root = root
+}
+
+
+// SetCallbacks sets the page management callbacks
+func (tree *BTree) SetCallbacks(
+	getFunc func(uint64) []byte,
+	newFunc func([]byte) uint64,
+	delFunc func(uint64),
+) {
+	tree.get = getFunc
+	tree.new = newFunc
+	tree.del = delFunc
+}
