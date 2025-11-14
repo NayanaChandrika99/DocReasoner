@@ -16,6 +16,7 @@ import (
 const (
 	DB_SIG          = "TreeStore01\x00\x00\x00\x00\x00" // Database signature (16 bytes)
 	BTREE_PAGE_SIZE = 4096                               // Must match btree package
+	META_PAGE_SIZE  = 80                                 // Meta page size (expanded for free list)
 )
 
 // KV represents a persistent key-value store
@@ -28,6 +29,9 @@ type KV struct {
 	// B+Tree
 	tree btree.BTree
 
+	// Free list for page recycling
+	free FreeList
+
 	// Memory-mapped file
 	mmap struct {
 		total  int      // Total mmap size
@@ -36,8 +40,9 @@ type KV struct {
 
 	// Page management
 	page struct {
-		flushed uint64   // Number of pages flushed to disk
-		temp    [][]byte // Temporary pages pending flush
+		flushed uint64              // Number of pages flushed to disk
+		temp    [][]byte            // Temporary pages pending flush
+		updates map[uint64][]byte   // In-place updates
 	}
 
 	// Error recovery
@@ -88,17 +93,36 @@ func (db *KV) Open() error {
 		}
 	}
 
-	// Setup B+Tree callbacks - fields are unexported
-	// We'll set them via the struct literal with field tags
+	// Initialize page updates map
+	db.page.updates = make(map[uint64][]byte)
+
+	// Setup free list callbacks
+	db.free.get = func(ptr uint64) []byte {
+		return db.pageRead(ptr)
+	}
+	db.free.new = func(node []byte) uint64 {
+		return db.pageAppend(node)
+	}
+	db.free.set = func(ptr uint64, node []byte) {
+		db.pageWrite(ptr, node)
+	}
+
+	// After loading from disk, all freed pages are available for reuse
+	// maxSeq will be set at the start of each transaction
+	if db.free.tailSeq > 0 {
+		db.free.maxSeq = db.free.tailSeq
+	}
+
+	// Setup B+Tree callbacks
 	db.tree.SetCallbacks(
 		func(ptr uint64) []byte {
 			return db.pageRead(ptr)
 		},
 		func(node []byte) uint64 {
-			return db.pageAppend(node)
+			return db.pageAlloc(node)
 		},
-		func(uint64) {
-			// Deletion handled by free list (Week 3)
+		func(ptr uint64) {
+			db.pageFree(ptr)
 		},
 	)
 
@@ -148,8 +172,27 @@ func (db *KV) Del(key []byte) (bool, error) {
 	return deleted, err
 }
 
+// Scan performs a range scan starting from the given key
+func (db *KV) Scan(start []byte, callback func(key, val []byte) bool) {
+	db.tree.Scan(start, callback)
+}
+
 // pageRead reads a page by pointer
 func (db *KV) pageRead(ptr uint64) []byte {
+	// Check pending updates first
+	if page, ok := db.page.updates[ptr]; ok {
+		return page
+	}
+
+	// Check temp pages
+	if ptr >= db.page.flushed {
+		idx := ptr - db.page.flushed
+		if idx < uint64(len(db.page.temp)) {
+			return db.page.temp[idx]
+		}
+	}
+
+	// Read from mmap
 	start := uint64(0)
 	for _, chunk := range db.mmap.chunks {
 		end := start + uint64(len(chunk))/BTREE_PAGE_SIZE
@@ -159,10 +202,28 @@ func (db *KV) pageRead(ptr uint64) []byte {
 		}
 		start = end
 	}
-	panic("bad page pointer")
+	panic(fmt.Sprintf("bad page pointer: %d (flushed: %d, temp: %d)", ptr, db.page.flushed, len(db.page.temp)))
 }
 
-// pageAppend allocates a new page
+// pageAlloc allocates a new page (tries free list first)
+func (db *KV) pageAlloc(node []byte) uint64 {
+	if len(node) != BTREE_PAGE_SIZE {
+		panic("page size mismatch")
+	}
+
+	// Try to get a page from free list
+	ptr := db.free.PopHead()
+	if ptr != 0 {
+		// Reuse freed page
+		db.page.updates[ptr] = node
+		return ptr
+	}
+
+	// Append new page
+	return db.pageAppend(node)
+}
+
+// pageAppend allocates a new page at the end
 func (db *KV) pageAppend(node []byte) uint64 {
 	if len(node) != BTREE_PAGE_SIZE {
 		panic("page size mismatch")
@@ -173,12 +234,34 @@ func (db *KV) pageAppend(node []byte) uint64 {
 	return ptr
 }
 
+// pageWrite updates a page in-place
+func (db *KV) pageWrite(ptr uint64, node []byte) {
+	if len(node) != BTREE_PAGE_SIZE {
+		panic("page size mismatch")
+	}
+	db.page.updates[ptr] = node
+}
+
+// pageFree adds a page to the free list
+func (db *KV) pageFree(ptr uint64) {
+	// Only free pages that were already flushed to disk
+	// Temp pages can't be reused until they're committed
+	if ptr < db.page.flushed {
+		db.free.PushTail(ptr)
+	}
+}
+
 // saveMeta saves current meta state to byte slice
 func (db *KV) saveMeta() []byte {
-	var data [32]byte
+	var data [META_PAGE_SIZE]byte
 	copy(data[:16], []byte(DB_SIG))
 	binary.LittleEndian.PutUint64(data[16:], db.tree.GetRoot())
 	binary.LittleEndian.PutUint64(data[24:], db.page.flushed)
+
+	// Save free list metadata
+	freeData := db.free.Serialize()
+	copy(data[32:], freeData)
+
 	return data[:]
 }
 
@@ -186,11 +269,14 @@ func (db *KV) saveMeta() []byte {
 func (db *KV) loadMeta(data []byte) {
 	db.tree.SetRoot(binary.LittleEndian.Uint64(data[16:]))
 	db.page.flushed = binary.LittleEndian.Uint64(data[24:])
+
+	// Load free list metadata
+	db.free.Deserialize(data[32:72])
 }
 
 // readMeta reads and validates meta page from disk
 func (db *KV) readMeta() error {
-	data := db.mmap.chunks[0][:32]
+	data := db.mmap.chunks[0][:META_PAGE_SIZE]
 
 	// Verify signature
 	sig := string(data[:16])
@@ -215,6 +301,10 @@ func (db *KV) updateOrRevert(meta []byte) error {
 		db.failed = false
 	}
 
+	// Save current tailSeq and freeze free list for this transaction
+	savedMaxSeq := db.free.maxSeq
+	db.free.SetMaxSeq()
+
 	// Two-phase update
 	err := db.updateFile()
 
@@ -222,7 +312,12 @@ func (db *KV) updateOrRevert(meta []byte) error {
 		// Revert in-memory state
 		db.loadMeta(meta)
 		db.page.temp = db.page.temp[:0]
+		db.page.updates = make(map[uint64][]byte)
+		db.free.maxSeq = savedMaxSeq
 		db.failed = true
+	} else {
+		// Success - all freed pages including newly freed ones are now available
+		db.free.maxSeq = db.free.tailSeq
 	}
 
 	return err
@@ -251,6 +346,18 @@ func (db *KV) updateFile() error {
 
 // writePages writes temporary pages to disk
 func (db *KV) writePages() error {
+	// Write in-place updates first
+	for ptr, page := range db.page.updates {
+		offset := int64(ptr * BTREE_PAGE_SIZE)
+		if _, err := syscall.Pwrite(db.fd, page, offset); err != nil {
+			return err
+		}
+	}
+
+	// Clear updates after writing
+	db.page.updates = make(map[uint64][]byte)
+
+	// Write new pages
 	if len(db.page.temp) == 0 {
 		return nil
 	}
