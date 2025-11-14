@@ -1,0 +1,4 @@
+./simple_store.go
+./types.go
+./benchmark_test.go
+./store_test.go

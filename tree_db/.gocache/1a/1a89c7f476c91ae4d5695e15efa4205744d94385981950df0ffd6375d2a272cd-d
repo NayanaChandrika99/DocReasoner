@@ -1,0 +1,5 @@
+./encoding.go
+./freelist.go
+./indexes.go
+./kv.go
+./transaction.go

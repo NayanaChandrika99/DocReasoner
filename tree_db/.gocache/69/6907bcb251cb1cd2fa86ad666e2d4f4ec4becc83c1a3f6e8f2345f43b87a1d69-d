@@ -1,0 +1,11 @@
+./encoding.go
+./freelist.go
+./indexes.go
+./kv.go
+./transaction.go
+./benchmark_test.go
+./encoding_test.go
+./freelist_test.go
+./kv_test.go
+./range_test.go
+./transaction_test.go
