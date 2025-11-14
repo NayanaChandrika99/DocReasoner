@@ -1,0 +1,376 @@
+syntax = "proto3";
+
+package treestore;
+
+option go_package = "github.com/nainya/treestore/proto";
+
+import "google/protobuf/timestamp.proto";
+
+// TreeStoreService provides hierarchical document storage with versioning
+service TreeStoreService {
+    // ========== Document Operations (3 methods) ==========
+    rpc StoreDocument(StoreDocumentRequest) returns (StoreDocumentResponse);
+    rpc GetDocument(GetDocumentRequest) returns (GetDocumentResponse);
+    rpc DeleteDocument(DeleteDocumentRequest) returns (DeleteDocumentResponse);
+
+    // ========== Node Operations (4 methods) ==========
+    rpc GetNode(GetNodeRequest) returns (GetNodeResponse);
+    rpc GetChildren(GetChildrenRequest) returns (GetChildrenResponse);
+    rpc GetSubtree(GetSubtreeRequest) returns (GetSubtreeResponse);
+    rpc GetAncestorPath(GetAncestorPathRequest) returns (GetAncestorPathResponse);
+
+    // ========== Search Operations (2 methods) ==========
+    rpc SearchByKeyword(SearchRequest) returns (SearchResponse);
+    rpc GetNodesByPage(GetNodesByPageRequest) returns (GetNodesByPageResponse);
+
+    // ========== Version Operations (2 methods) ==========
+    rpc GetVersionAsOf(GetVersionAsOfRequest) returns (PolicyVersion);
+    rpc ListVersions(ListVersionsRequest) returns (ListVersionsResponse);
+
+    // ========== Metadata Operations (7 methods) ==========
+    rpc StoreToolResult(StoreToolResultRequest) returns (StoreToolResultResponse);
+    rpc GetToolResults(GetToolResultsRequest) returns (GetToolResultsResponse);
+    rpc StoreTrajectory(StoreTrajectoryRequest) returns (StoreTrajectoryResponse);
+    rpc GetTrajectories(GetTrajectoriesRequest) returns (GetTrajectoriesResponse);
+    rpc StoreCrossReference(StoreCrossReferenceRequest) returns (StoreCrossReferenceResponse);
+    rpc GetCrossReferences(GetCrossReferencesRequest) returns (GetCrossReferencesResponse);
+    rpc StoreContradiction(StoreContradictionRequest) returns (StoreContradictionResponse);
+
+    // ========== Prompt Operations (3 methods) ==========
+    rpc StorePrompt(StorePromptRequest) returns (StorePromptResponse);
+    rpc GetPrompt(GetPromptRequest) returns (GetPromptResponse);
+    rpc RecordPromptUsage(RecordPromptUsageRequest) returns (RecordPromptUsageResponse);
+
+    // ========== Health & Status (2 methods) ==========
+    rpc Health(HealthRequest) returns (HealthResponse);
+    rpc Stats(StatsRequest) returns (StatsResponse);
+}
+
+// ========== Core Data Types ==========
+
+message Document {
+    string policy_id = 1;
+    string version_id = 2;
+    string pageindex_doc_id = 3;
+    string root_node_id = 4;
+    map<string, string> metadata = 5;
+    google.protobuf.Timestamp created_at = 6;
+    google.protobuf.Timestamp updated_at = 7;
+}
+
+message Node {
+    string node_id = 1;
+    string policy_id = 2;
+    string parent_id = 3;  // Empty string for root
+    string title = 4;
+    int32 page_start = 5;
+    int32 page_end = 6;
+    string summary = 7;
+    string text = 8;
+    string section_path = 9;  // e.g., "1.2.3"
+    repeated string child_ids = 10;
+    int32 depth = 11;
+    google.protobuf.Timestamp created_at = 12;
+    google.protobuf.Timestamp updated_at = 13;
+}
+
+message PolicyVersion {
+    string policy_id = 1;
+    string version_id = 2;
+    string document_id = 3;
+    google.protobuf.Timestamp created_at = 4;
+    string created_by = 5;
+    string description = 6;
+    repeated string tags = 7;
+}
+
+message ToolResult {
+    string tool_name = 1;
+    string execution_id = 2;
+    string policy_id = 3;
+    string node_id = 4;
+    string result_data = 5;  // JSON string
+    bool success = 6;
+    string error_message = 7;
+    google.protobuf.Timestamp executed_at = 8;
+}
+
+message Trajectory {
+    string trajectory_id = 1;
+    string case_id = 2;
+    repeated TrajectoryStep steps = 3;
+    google.protobuf.Timestamp started_at = 4;
+    google.protobuf.Timestamp completed_at = 5;
+}
+
+message TrajectoryStep {
+    int32 step_number = 1;
+    string tool_name = 2;
+    string action = 3;
+    string observation = 4;
+    string thought = 5;
+    google.protobuf.Timestamp timestamp = 6;
+}
+
+message CrossReference {
+    string source_policy_id = 1;
+    string source_node_id = 2;
+    string target_policy_id = 3;
+    string target_node_id = 4;
+    string reference_type = 5;  // "cites", "contradicts", "supports"
+    string context = 6;
+    google.protobuf.Timestamp created_at = 7;
+}
+
+message Contradiction {
+    string contradiction_id = 1;
+    string policy_id_a = 2;
+    string node_id_a = 3;
+    string policy_id_b = 4;
+    string node_id_b = 5;
+    string description = 6;
+    string severity = 7;  // "low", "medium", "high"
+    google.protobuf.Timestamp detected_at = 8;
+}
+
+message PromptTemplate {
+    string prompt_id = 1;
+    string name = 2;
+    string template = 3;
+    repeated string variables = 4;
+    string version = 5;
+    google.protobuf.Timestamp created_at = 6;
+}
+
+message PromptUsage {
+    string usage_id = 1;
+    string prompt_id = 2;
+    map<string, string> filled_variables = 3;
+    string response = 4;
+    google.protobuf.Timestamp used_at = 5;
+}
+
+// ========== Document Operation Messages ==========
+
+message StoreDocumentRequest {
+    Document document = 1;
+    repeated Node nodes = 2;
+}
+
+message StoreDocumentResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+message GetDocumentRequest {
+    string policy_id = 1;
+}
+
+message GetDocumentResponse {
+    Document document = 1;
+    repeated Node nodes = 2;
+}
+
+message DeleteDocumentRequest {
+    string policy_id = 1;
+}
+
+message DeleteDocumentResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+// ========== Node Operation Messages ==========
+
+message GetNodeRequest {
+    string policy_id = 1;
+    string node_id = 2;
+}
+
+message GetNodeResponse {
+    Node node = 1;
+}
+
+message GetChildrenRequest {
+    string policy_id = 1;
+    string parent_id = 2;  // Empty for root children
+}
+
+message GetChildrenResponse {
+    repeated Node children = 1;
+}
+
+message GetSubtreeRequest {
+    string policy_id = 1;
+    string node_id = 2;
+    int32 max_depth = 3;  // 0 = unlimited
+}
+
+message GetSubtreeResponse {
+    repeated Node nodes = 1;
+}
+
+message GetAncestorPathRequest {
+    string policy_id = 1;
+    string node_id = 2;
+}
+
+message GetAncestorPathResponse {
+    repeated Node ancestors = 1;  // From root to node
+}
+
+// ========== Search Operation Messages ==========
+
+message SearchRequest {
+    string policy_id = 1;
+    string query = 2;
+    int32 limit = 3;
+}
+
+message SearchResponse {
+    repeated SearchResult results = 1;
+}
+
+message SearchResult {
+    Node node = 1;
+    float score = 2;
+}
+
+message GetNodesByPageRequest {
+    string policy_id = 1;
+    int32 page_number = 2;
+}
+
+message GetNodesByPageResponse {
+    repeated Node nodes = 1;
+}
+
+// ========== Version Operation Messages ==========
+
+message GetVersionAsOfRequest {
+    string policy_id = 1;
+    google.protobuf.Timestamp as_of_time = 2;
+}
+
+message ListVersionsRequest {
+    string policy_id = 1;
+    int32 limit = 2;
+}
+
+message ListVersionsResponse {
+    repeated PolicyVersion versions = 1;
+}
+
+// ========== Metadata Operation Messages ==========
+
+message StoreToolResultRequest {
+    ToolResult result = 1;
+}
+
+message StoreToolResultResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+message GetToolResultsRequest {
+    string policy_id = 1;
+    string tool_name = 2;  // Optional filter
+    int32 limit = 3;
+}
+
+message GetToolResultsResponse {
+    repeated ToolResult results = 1;
+}
+
+message StoreTrajectoryRequest {
+    Trajectory trajectory = 1;
+}
+
+message StoreTrajectoryResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+message GetTrajectoriesRequest {
+    string case_id = 1;
+    int32 limit = 2;
+}
+
+message GetTrajectoriesResponse {
+    repeated Trajectory trajectories = 1;
+}
+
+message StoreCrossReferenceRequest {
+    CrossReference cross_reference = 1;
+}
+
+message StoreCrossReferenceResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+message GetCrossReferencesRequest {
+    string policy_id = 1;
+    string node_id = 2;
+}
+
+message GetCrossReferencesResponse {
+    repeated CrossReference references = 1;
+}
+
+message StoreContradictionRequest {
+    Contradiction contradiction = 1;
+}
+
+message StoreContradictionResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+// ========== Prompt Operation Messages ==========
+
+message StorePromptRequest {
+    PromptTemplate prompt = 1;
+}
+
+message StorePromptResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+message GetPromptRequest {
+    string prompt_id = 1;
+}
+
+message GetPromptResponse {
+    PromptTemplate prompt = 1;
+}
+
+message RecordPromptUsageRequest {
+    PromptUsage usage = 1;
+}
+
+message RecordPromptUsageResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+// ========== Health & Status Messages ==========
+
+message HealthRequest {}
+
+message HealthResponse {
+    bool healthy = 1;
+    string version = 2;
+    int64 uptime_seconds = 3;
+}
+
+message StatsRequest {}
+
+message StatsResponse {
+    int64 total_documents = 1;
+    int64 total_nodes = 2;
+    int64 total_versions = 3;
+    int64 db_size_bytes = 4;
+    map<string, int64> operation_counts = 5;
+}
