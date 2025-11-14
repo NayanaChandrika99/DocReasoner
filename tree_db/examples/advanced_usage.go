@@ -43,6 +43,7 @@ func main() {
 
 func exampleQueryEngine(kv *storage.KV) {
 	engine := query.NewEngine(kv)
+	docStore := document.NewSimpleStore(kv)
 	now := time.Now()
 
 	// Setup: Create sample data
@@ -66,7 +67,7 @@ func exampleQueryEngine(kv *storage.KV) {
 		},
 	}
 
-	engine.docStore.StoreDocument(doc, nodes)
+	docStore.StoreDocument(doc, nodes)
 
 	// Use query builder for type-safe queries
 	q := query.NewQueryBuilder(query.QueryDocument).
@@ -95,6 +96,9 @@ func exampleQueryEngine(kv *storage.KV) {
 
 func exampleEnrichedResults(kv *storage.KV) {
 	engine := query.NewEngine(kv)
+	docStore := document.NewSimpleStore(kv)
+	metaStore := metadata.NewMetadataStore(kv)
+	verStore := version.NewVersionStore(kv)
 	now := time.Now()
 
 	// Create document
@@ -119,10 +123,10 @@ func exampleEnrichedResults(kv *storage.KV) {
 		},
 	}
 
-	engine.docStore.StoreDocument(doc, nodes)
+	docStore.StoreDocument(doc, nodes)
 
 	// Add metadata
-	engine.metaStore.SetMetadata(&metadata.MetadataEntry{
+	metaStore.SetMetadata(&metadata.MetadataEntry{
 		EntityType: "node",
 		EntityID:   "node-enriched",
 		Key:        "classification",
@@ -132,7 +136,7 @@ func exampleEnrichedResults(kv *storage.KV) {
 		UpdatedAt:  now,
 	})
 
-	engine.metaStore.SetMetadata(&metadata.MetadataEntry{
+	metaStore.SetMetadata(&metadata.MetadataEntry{
 		EntityType: "node",
 		EntityID:   "node-enriched",
 		Key:        "reviewer",
@@ -143,7 +147,7 @@ func exampleEnrichedResults(kv *storage.KV) {
 	})
 
 	// Create version
-	engine.verStore.CreateVersion(&version.Version{
+	verStore.CreateVersion(&version.Version{
 		PolicyID:    "policy-enriched",
 		VersionID:   "v1.0.0",
 		DocumentID:  "doc-enriched",
@@ -270,6 +274,7 @@ func exampleConversations(kv *storage.KV) {
 
 func exampleRelatedEntities(kv *storage.KV) {
 	engine := query.NewEngine(kv)
+	metaStore := metadata.NewMetadataStore(kv)
 	now := time.Now()
 
 	// Create multiple documents with same project tag
@@ -286,7 +291,7 @@ func exampleRelatedEntities(kv *storage.KV) {
 
 	for _, p := range projects {
 		// Add document metadata
-		engine.metaStore.SetMetadata(&metadata.MetadataEntry{
+		metaStore.SetMetadata(&metadata.MetadataEntry{
 			EntityType: "document",
 			EntityID:   p.docID,
 			Key:        "project",
@@ -296,7 +301,7 @@ func exampleRelatedEntities(kv *storage.KV) {
 			UpdatedAt:  now,
 		})
 
-		engine.metaStore.SetMetadata(&metadata.MetadataEntry{
+		metaStore.SetMetadata(&metadata.MetadataEntry{
 			EntityType: "document",
 			EntityID:   p.docID,
 			Key:        "title",
@@ -315,13 +320,13 @@ func exampleRelatedEntities(kv *storage.KV) {
 
 	fmt.Printf("✓ Found %d documents related to doc-alpha-1:\n", len(related))
 	for _, relatedID := range related {
-		meta, _ := engine.metaStore.GetAllMetadata("document", relatedID)
+		meta, _ := metaStore.GetAllMetadata("document", relatedID)
 		fmt.Printf("  - %s (%s)\n", relatedID, meta["title"])
 	}
 
 	// Multi-attribute filtering
 	docType := "document"
-	alphaProject, err := engine.metaStore.QueryMultiple(map[string]string{
+	alphaProject, err := metaStore.QueryMultiple(map[string]string{
 		"project": "project-alpha",
 	}, &docType, 0)
 	if err != nil {
