@@ -8,7 +8,10 @@ from typing import List, Dict, Any, Optional
 
 from reasoning_service.services.llm_client import LLMClient, LLMClientError
 from reasoning_service.services.tools import get_tool_definitions
-from reasoning_service.services.tool_handlers import ToolExecutor
+from reasoning_service.services.tool_handlers import ToolExecutor, ToolTimeoutError
+from reasoning_service.services.treestore_client import TreeStoreClient
+from reasoning_service.services.pubmed import PubMedClient, PubMedCache
+from reasoning_service.observability.react_metrics import record_confidence_score
 from reasoning_service.prompts.react_system_prompt import REACT_SYSTEM_PROMPT, PROMPT_VERSION
 from reasoning_service.models.schema import (
     CaseBundle,
@@ -21,6 +24,7 @@ from reasoning_service.models.schema import (
     RetrievalMethod,
 )
 from reasoning_service.config import settings
+from reasoning_service.utils.logging import get_logger
 
 
 class ReActController:
@@ -34,6 +38,9 @@ class ReActController:
         max_iterations: Optional[int] = None,
         verbose: bool = False,
         system_prompt: Optional[str] = None,
+        treestore_client: Optional[TreeStoreClient] = None,
+        pubmed_client: Optional[PubMedClient] = None,
+        pubmed_cache: Optional[PubMedCache] = None,
     ):
         """Initialize ReAct controller.
 
@@ -47,11 +54,28 @@ class ReActController:
         self.llm = llm_client or LLMClient()
         self.retrieval_service = retrieval_service
         self.fts5_service = fts5_service
+        self.treestore_client = treestore_client
+        self.pubmed_client = pubmed_client
+        self.pubmed_cache = pubmed_cache
         self.max_iterations = max_iterations or settings.controller_max_iterations
         self.verbose = verbose
         self.tools = get_tool_definitions()
         self.system_prompt = system_prompt or REACT_SYSTEM_PROMPT
         self.prompt_version = PROMPT_VERSION
+        self.logger = get_logger(__name__)
+        self.tool_timeout_seconds = settings.controller_tool_timeout_seconds
+        self.tool_timeout_overrides = dict(settings.controller_tool_timeout_overrides or {})
+        self.tool_retry_limit = max(0, settings.controller_tool_retry_limit)
+
+        if settings.pubmed_enabled and self.pubmed_client is None:
+            self.pubmed_client = PubMedClient(
+                api_key=settings.pubmed_api_key or None,
+                timeout=settings.pubmed_timeout_seconds,
+            )
+        if settings.pubmed_enabled and self.pubmed_cache is None:
+            self.pubmed_cache = PubMedCache(
+                ttl_seconds=settings.pubmed_cache_ttl_seconds
+            )
 
     async def evaluate_case(
         self,
@@ -101,6 +125,9 @@ class ReActController:
             retrieval_service=self.retrieval_service,
             case_bundle=case_bundle,
             fts5_service=self.fts5_service,
+            treestore_client=self.treestore_client,
+            pubmed_client=self.pubmed_client,
+            pubmed_cache=self.pubmed_cache,
         )
 
         # Build messages
@@ -114,6 +141,7 @@ class ReActController:
                 "content": self._build_user_prompt(criterion_id, case_bundle),
             },
         ]
+        tool_history: List[Dict[str, Any]] = []
 
         # ReAct loop
         reasoning_trace = []
@@ -138,6 +166,9 @@ class ReActController:
                     criterion_id=criterion_id,
                     error=f"LLM call failed: {str(e)}",
                     reasoning_trace=reasoning_trace,
+                    case_bundle=case_bundle,
+                    latency_ms=int((time.time() - start_time) * 1000),
+                    tool_history=tool_history,
                 )
 
             # Add assistant message to history
@@ -170,18 +201,32 @@ class ReActController:
                                 "input": decision_args,
                                 "observation": f"Status: {decision_args.get('status')}, Confidence: {decision_args.get('confidence')}",
                             })
+                            tool_history.append(
+                                {
+                                    "action": "finish",
+                                    "success": True,
+                                    "latency_ms": 0,
+                                    "attempt": 1,
+                                    "timeout": False,
+                                }
+                            )
                             return self._build_result_from_finish(
                                 criterion_id=criterion_id,
                                 decision_args=decision_args,
                                 reasoning_trace=reasoning_trace,
                                 messages=messages,
                                 latency_ms=int((time.time() - start_time) * 1000),
+                                case_bundle=case_bundle,
+                                tool_history=tool_history,
                             )
                         except json.JSONDecodeError:
                             return self._build_error_result(
                                 criterion_id=criterion_id,
                                 error="Failed to parse finish() arguments",
                                 reasoning_trace=reasoning_trace,
+                                case_bundle=case_bundle,
+                                tool_history=tool_history,
+                                latency_ms=int((time.time() - start_time) * 1000),
                             )
 
             # Execute tool calls
@@ -206,11 +251,37 @@ class ReActController:
                     if self.verbose:
                         print(f"Tool: {func_name}({tool_args})")
 
-                    # Execute tool
-                    try:
-                        result = await executor.execute(func_name, tool_args)
-                    except Exception as e:
-                        result = json.dumps({"success": False, "error": str(e)})
+                    # Execute tool with timeout/retry policy
+                    timeout_seconds = self._tool_timeout_for(func_name or "")
+                    result = await self._execute_tool_call(
+                        executor=executor,
+                        func_name=func_name or "unknown",
+                        tool_args=tool_args,
+                        timeout=timeout_seconds,
+                        tool_history=tool_history,
+                    )
+
+                    if result is None:
+                        observation = (
+                            f"{func_name or 'tool'} timed out after {timeout_seconds:.2f}s"
+                        )
+                        reasoning_trace.append(
+                            {
+                                "step": iteration,
+                                "action": func_name or "unknown",
+                                "input": tool_args,
+                                "observation": observation,
+                            }
+                        )
+                        return self._build_error_result(
+                            criterion_id=criterion_id,
+                            error=observation,
+                            reasoning_trace=reasoning_trace,
+                            reason_code="tool_timeout",
+                            case_bundle=case_bundle,
+                            tool_history=tool_history,
+                            latency_ms=int((time.time() - start_time) * 1000),
+                        )
 
                     if self.verbose:
                         result_preview = result[:200] + "..." if len(result) > 200 else result
@@ -239,6 +310,9 @@ class ReActController:
                     criterion_id=criterion_id,
                     error="Agent stopped without calling finish()",
                     reasoning_trace=reasoning_trace,
+                    case_bundle=case_bundle,
+                    tool_history=tool_history,
+                    latency_ms=int((time.time() - start_time) * 1000),
                 )
 
         # Max iterations reached
@@ -246,6 +320,9 @@ class ReActController:
             criterion_id=criterion_id,
             error=f"Max iterations ({self.max_iterations}) reached",
             reasoning_trace=reasoning_trace,
+            case_bundle=case_bundle,
+            tool_history=tool_history,
+            latency_ms=int((time.time() - start_time) * 1000),
         )
 
     def _build_user_prompt(
@@ -296,6 +373,8 @@ Begin your analysis now.
         reasoning_trace: List[Dict],
         messages: List[Dict],
         latency_ms: int,
+        case_bundle: CaseBundle,
+        tool_history: List[Dict[str, Any]],
     ) -> CriterionResult:
         """Build CriterionResult from finish() arguments.
 
@@ -327,9 +406,10 @@ Begin your analysis now.
         )
 
         # Build citation
+        policy_version = case_bundle.metadata.get("policy_version_id", "v1.0")
         citation = CitationInfo(
-            doc=decision_args.get("policy_section", "Unknown"),
-            version="v1.0",  # TODO: Get from case_bundle
+            doc=case_bundle.policy_id,
+            version=policy_version,
             section=decision_args.get("policy_section", "Unknown"),
             pages=decision_args.get("policy_pages", []),
         )
@@ -344,7 +424,7 @@ Begin your analysis now.
                 text_excerpt="",
             )
 
-        return CriterionResult(
+        result = CriterionResult(
             criterion_id=criterion_id,
             status=status,
             evidence=evidence,
@@ -364,12 +444,27 @@ Begin your analysis now.
                 for t in reasoning_trace
             ],
         )
+        record_confidence_score(confidence)
+        self._log_decision_event(
+            case_bundle=case_bundle,
+            criterion_id=criterion_id,
+            status=result.status.value,
+            confidence=confidence,
+            reason_code=result.reason_code,
+            latency_ms=latency_ms,
+            tool_history=tool_history,
+        )
+        return result
 
     def _build_error_result(
         self,
         criterion_id: str,
         error: str,
         reasoning_trace: List[Dict],
+        case_bundle: CaseBundle,
+        tool_history: List[Dict[str, Any]],
+        reason_code: str = "agent_error",
+        latency_ms: Optional[int] = None,
     ) -> CriterionResult:
         """Build error result when agent fails.
 
@@ -381,7 +476,7 @@ Begin your analysis now.
         Returns:
             CriterionResult with UNCERTAIN status
         """
-        return CriterionResult(
+        result = CriterionResult(
             criterion_id=criterion_id,
             status=DecisionStatus.UNCERTAIN,
             evidence=None,
@@ -393,7 +488,7 @@ Begin your analysis now.
             ),
             search_trajectory=[],
             retrieval_method=RetrievalMethod.PAGEINDEX_LLM,
-            reason_code="agent_error",
+            reason_code=reason_code,
             reasoning_trace=[
                 ReasoningStep(
                     step=t["step"],
@@ -403,6 +498,16 @@ Begin your analysis now.
                 for t in reasoning_trace
             ],
         )
+        self._log_decision_event(
+            case_bundle=case_bundle,
+            criterion_id=criterion_id,
+            status=result.status.value,
+            confidence=result.confidence,
+            reason_code=reason_code,
+            latency_ms=latency_ms,
+            tool_history=tool_history,
+        )
+        return result
 
     async def _identify_criteria(
         self,
@@ -425,3 +530,88 @@ Begin your analysis now.
             return [fallback]
 
         return [f"{case_bundle.policy_id}:default"]
+
+    def _tool_timeout_for(self, tool_name: str) -> float:
+        """Return timeout budget for a tool."""
+        return float(self.tool_timeout_overrides.get(tool_name, self.tool_timeout_seconds))
+
+    async def _execute_tool_call(
+        self,
+        executor: ToolExecutor,
+        func_name: str,
+        tool_args: Dict[str, Any],
+        timeout: float,
+        tool_history: List[Dict[str, Any]],
+    ) -> Optional[str]:
+        """Execute a tool with retry and timeout tracking."""
+        attempts = 0
+        while attempts <= self.tool_retry_limit:
+            attempts += 1
+            start = time.perf_counter()
+            try:
+                payload = await executor.execute(func_name, tool_args, timeout=timeout)
+                latency_ms = int((time.perf_counter() - start) * 1000)
+                tool_history.append(
+                    {
+                        "action": func_name,
+                        "success": True,
+                        "latency_ms": latency_ms,
+                        "attempt": attempts,
+                        "timeout": False,
+                    }
+                )
+                return payload
+            except ToolTimeoutError as exc:
+                latency_ms = int((time.perf_counter() - start) * 1000)
+                tool_history.append(
+                    {
+                        "action": func_name,
+                        "success": False,
+                        "latency_ms": latency_ms,
+                        "attempt": attempts,
+                        "timeout": True,
+                        "error": str(exc),
+                    }
+                )
+                if attempts > self.tool_retry_limit:
+                    return None
+            except Exception as exc:  # pylint: disable=broad-except
+                latency_ms = int((time.perf_counter() - start) * 1000)
+                tool_history.append(
+                    {
+                        "action": func_name,
+                        "success": False,
+                        "latency_ms": latency_ms,
+                        "attempt": attempts,
+                        "timeout": False,
+                        "error": str(exc),
+                    }
+                )
+                return json.dumps({"success": False, "error": str(exc)})
+        return None
+
+    def _log_decision_event(
+        self,
+        case_bundle: CaseBundle,
+        criterion_id: str,
+        status: str,
+        confidence: float,
+        reason_code: Optional[str],
+        latency_ms: Optional[int],
+        tool_history: List[Dict[str, Any]],
+    ) -> None:
+        """Emit structured log for downstream observability."""
+        extra = {
+            "event": "controller_decision",
+            "case_id": case_bundle.case_id,
+            "policy_id": case_bundle.policy_id,
+            "policy_version": case_bundle.metadata.get("policy_version_id"),
+            "criterion_id": criterion_id,
+            "status": status,
+            "confidence": confidence,
+            "reason_code": reason_code,
+            "latency_ms": latency_ms,
+            "tool_sequence": tool_history,
+            "prompt_version": self.prompt_version,
+        }
+        self.logger.info("controller_decision", extra=extra)

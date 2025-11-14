@@ -1,6 +1,6 @@
 """Configuration management for the reasoning service."""
 
-from typing import Literal, AsyncGenerator
+from typing import Literal, AsyncGenerator, Dict
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
@@ -59,6 +59,24 @@ class Settings(BaseSettings):
     react_shadow_mode: bool = False
     react_fallback_enabled: bool = True
     react_ab_test_ratio: float = 0.0
+    prompt_ab_test_ratio: float = 0.0
+    controller_tool_timeout_seconds: float = 12.0
+    controller_tool_timeout_overrides: Dict[str, float] = Field(default_factory=dict)
+    controller_tool_retry_limit: int = 1
+    retrieval_backend: Literal["pageindex", "treestore"] = "pageindex"
+    tool_rate_limit_per_minute: Dict[str, int] = Field(
+        default_factory=lambda: {
+            "pubmed_search": 30,
+            "pi_search": 120,
+        }
+    )
+
+    # Evidence Retrieval
+    pubmed_enabled: bool = False
+    pubmed_api_key: str = ""
+    pubmed_max_results: int = 3
+    pubmed_timeout_seconds: float = 15.0
+    pubmed_cache_ttl_seconds: int = 86400
 
     # LLM Provider Settings
     llm_provider: str = Field(

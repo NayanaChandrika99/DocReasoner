@@ -138,7 +138,7 @@ When writing complex features or significant refactors, use an ExecPlan (as desc
 
 ## Issue tracking
 
-- You MUST use your TodoWrite tool to keep track of what you're doing 
+- You MUST use your TodoWrite tool to keep track of what you're doing. skip this if tool is not available
 - You MUST NEVER discard tasks from your TodoWrite todo list without Nainy's explicit approval
 
 ## Systematic Debugging Process

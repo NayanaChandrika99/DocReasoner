@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import random
+import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from reasoning_service.models.schema import CriterionResult
+from reasoning_service.observability import react_metrics
 from reasoning_service.services.prompt_evaluator import EvaluationMetrics, PolicyEvaluator
 
 
@@ -120,12 +122,15 @@ class PromptOptimizer:
 
         best_result: Optional[EvaluationResult] = None
         current_prompt = base_prompt
+        run_start = time.perf_counter()
+        evaluation_count = 0
 
         for generation in range(generations):
             minibatch = self._select_minibatch(test_cases)
             candidate_payload = {"system_prompt": current_prompt}
             evaluation = await self.adapter.evaluate_candidate(candidate_payload, minibatch)
             self.history.append(evaluation)
+            evaluation_count += 1
 
             if not best_result or evaluation.metrics.aggregate_score > best_result.metrics.aggregate_score:
                 best_result = evaluation
@@ -143,6 +148,15 @@ class PromptOptimizer:
                     "citation_accuracy": best_result.metrics.citation_accuracy,
                 },
             )
+        duration = time.perf_counter() - run_start
+        status = "success" if best_result else "aborted"
+        react_metrics.record_gepa_run(
+            status=status,
+            duration_seconds=duration,
+            evaluation_count=evaluation_count,
+        )
+        if best_result:
+            react_metrics.record_gepa_prompt_metrics(best_result.metrics)
         return best_result
 
     def _select_minibatch(self, test_cases: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

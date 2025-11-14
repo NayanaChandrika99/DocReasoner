@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from reasoning_service.models.schema import CaseBundle, VLMField, DecisionStatus
 from reasoning_service.services.react_controller import ReActController
 from reasoning_service.services.llm_client import LLMClient
-from reasoning_service.services.tool_handlers import ToolExecutor
+from reasoning_service.services.tool_handlers import ToolExecutor, ToolTimeoutError
 from retrieval.service import RetrievalResult, NodeReference, Span
 
 
@@ -676,3 +676,195 @@ async def test_reasoning_trace_action_values(
     for i, expected_action in enumerate(expected_actions):
         assert actual_actions[i] == expected_action
 
+
+@pytest.mark.asyncio
+async def test_controller_retries_tool_after_timeout(
+    mock_llm_client,
+    mock_retrieval_service,
+    sample_case,
+):
+    """Controller should retry once when a tool times out."""
+    mock_llm_client.call_with_tools.side_effect = [
+        {
+            "role": "assistant",
+            "content": "Searching PT requirements",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "pi_search",
+                        "arguments": json.dumps({"query": "pt requirements"}),
+                    },
+                }
+            ],
+            "finish_reason": "tool_calls",
+        },
+        {
+            "role": "assistant",
+            "content": "Finishing",
+            "tool_calls": [
+                {
+                    "id": "call_2",
+                    "type": "function",
+                    "function": {
+                        "name": "finish",
+                        "arguments": json.dumps({
+                            "status": "met",
+                            "rationale": "All requirements satisfied",
+                            "confidence": 0.85,
+                            "policy_section": "Section 2.3",
+                            "policy_pages": [5],
+                        }),
+                    },
+                }
+            ],
+            "finish_reason": "tool_calls",
+        },
+    ]
+
+    attempt_counter = {"pi_search": 0}
+
+    async def fake_execute(self, tool_name, arguments, timeout=None):
+        if tool_name == "pi_search":
+            attempt_counter["pi_search"] += 1
+            if attempt_counter["pi_search"] == 1:
+                raise ToolTimeoutError(tool_name, timeout or 0)
+            return json.dumps({"success": True, "node_refs": []})
+        if tool_name == "finish":
+            return json.dumps({"success": True})
+        return json.dumps({"success": True})
+
+    controller = ReActController(
+        llm_client=mock_llm_client,
+        retrieval_service=mock_retrieval_service,
+        max_iterations=3,
+    )
+    controller.tool_retry_limit = 1
+
+    with patch.object(ToolExecutor, "execute", new=fake_execute):
+        results = await controller.evaluate_case(
+            case_bundle=sample_case,
+            policy_document_id="pi-test-doc-123",
+        )
+
+    assert attempt_counter["pi_search"] == 2
+    assert results[0].status == DecisionStatus.MET
+
+
+@pytest.mark.asyncio
+async def test_controller_abstains_after_repeated_timeouts(
+    mock_llm_client,
+    mock_retrieval_service,
+    sample_case,
+):
+    """Controller should return UNCERTAIN when tool keeps timing out."""
+    mock_llm_client.call_with_tools.return_value = {
+        "role": "assistant",
+        "content": "Searching",
+        "tool_calls": [
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "pi_search",
+                    "arguments": json.dumps({"query": "pt requirements"}),
+                },
+            }
+        ],
+        "finish_reason": "tool_calls",
+    }
+
+    async def always_timeout(self, tool_name, arguments, timeout=None):
+        raise ToolTimeoutError(tool_name, timeout or 0)
+
+    controller = ReActController(
+        llm_client=mock_llm_client,
+        retrieval_service=mock_retrieval_service,
+        max_iterations=3,
+    )
+    controller.tool_retry_limit = 1
+
+    with patch.object(ToolExecutor, "execute", new=always_timeout):
+        results = await controller.evaluate_case(
+            case_bundle=sample_case,
+            policy_document_id="pi-test-doc-123",
+        )
+
+    assert results[0].status == DecisionStatus.UNCERTAIN
+    assert results[0].reason_code == "tool_timeout"
+
+
+@patch("reasoning_service.services.react_controller.record_confidence_score")
+@pytest.mark.asyncio
+async def test_controller_logs_tool_sequence_and_confidence_metric(
+    mock_conf_metric,
+    mock_llm_client,
+    mock_retrieval_service,
+    sample_case,
+):
+    """Controller emits structured log with tool sequence and records gauge."""
+    mock_llm_client.call_with_tools.side_effect = [
+        {
+            "role": "assistant",
+            "content": "Searching PT requirements",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "pi_search",
+                        "arguments": json.dumps({"query": "pt requirements"}),
+                    },
+                }
+            ],
+            "finish_reason": "tool_calls",
+        },
+        {
+            "role": "assistant",
+            "content": "Finishing",
+            "tool_calls": [
+                {
+                    "id": "call_2",
+                    "type": "function",
+                    "function": {
+                        "name": "finish",
+                        "arguments": json.dumps({
+                            "status": "met",
+                            "rationale": "All requirements satisfied",
+                            "confidence": 0.9,
+                            "policy_section": "Section 2.3",
+                            "policy_pages": [5],
+                        }),
+                    },
+                }
+            ],
+            "finish_reason": "tool_calls",
+        },
+    ]
+
+    async def fake_execute(self, tool_name, arguments, timeout=None):
+        if tool_name == "pi_search":
+            return json.dumps({"success": True, "node_refs": []})
+        if tool_name == "finish":
+            return json.dumps({"success": True})
+        return json.dumps({"success": True})
+
+    controller = ReActController(
+        llm_client=mock_llm_client,
+        retrieval_service=mock_retrieval_service,
+        max_iterations=3,
+    )
+    controller.logger = MagicMock()
+
+    with patch.object(ToolExecutor, "execute", new=fake_execute):
+        await controller.evaluate_case(
+            case_bundle=sample_case,
+            policy_document_id="pi-test-doc-123",
+        )
+
+    controller.logger.info.assert_called()
+    _, kwargs = controller.logger.info.call_args
+    assert "tool_sequence" in kwargs["extra"]
+    assert kwargs["extra"]["tool_sequence"][0]["action"] == "pi_search"
+    mock_conf_metric.assert_called_with(0.9)

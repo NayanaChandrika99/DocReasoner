@@ -11,7 +11,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -26,8 +25,6 @@ from reasoning_service.models.schema import (
     RetrievalMethod,
 )
 from reasoning_service.prompts.react_system_prompt import REACT_SYSTEM_PROMPT
-from reasoning_service.services.react_controller import ReActController as LLMReActController
-from reasoning_service.services.retrieval import RetrievalService as AsyncRetrievalService
 from reasoning_service.services.prompt_evaluator import MetricWeights, PolicyEvaluator
 from reasoning_service.services.prompt_optimizer import (
     OptimizationConfig,
@@ -35,40 +32,16 @@ from reasoning_service.services.prompt_optimizer import (
     ReActControllerAdapter,
 )
 from reasoning_service.services.prompt_registry import PromptRegistry
-from reasoning_service.utils.case_conversion import case_dict_to_case_bundle
-
-
-@dataclass
-class EvaluationCase:
-    case_bundle: CaseBundle
-    policy_document_id: str
-    source: str
+from reasoning_service.services.gepa_runner import (
+    EvaluationCase,
+    FileSystemDatasetLoader,
+    GEPAEvaluationRunner,
+)
 
 
 async def _simulate_evaluation(candidate: Dict[str, Any], minibatch: List[EvaluationCase]):
     """Fake evaluation used for dry runs."""
     return [_synthetic_result(entry.case_bundle) for entry in minibatch]
-
-
-async def _evaluate_with_controller(candidate: Dict[str, Any], minibatch: List[EvaluationCase]):
-    """Real evaluation that calls the LLM controller."""
-    retrieval_service = AsyncRetrievalService()
-    controller = LLMReActController(
-        retrieval_service=retrieval_service,
-        system_prompt=candidate["system_prompt"],
-    )
-    results: List[CriterionResult] = []
-    try:
-        for entry in minibatch:
-            result_batch = await controller.evaluate_case(
-                case_bundle=entry.case_bundle,
-                policy_document_id=entry.policy_document_id,
-            )
-            results.extend(result_batch)
-    finally:
-        await retrieval_service.close()
-    return results
-
 
 async def main() -> None:
     parser = argparse.ArgumentParser(description="Optimize the ReAct system prompt.")
@@ -107,13 +80,18 @@ async def main() -> None:
         )
     )
 
-    dataset = _load_dataset(args.cases_path)
+    dataset_loader = FileSystemDatasetLoader(args.cases_path)
+    dataset = dataset_loader.load()
+    runner = GEPAEvaluationRunner()
 
     if args.dry_run:
         evaluate_fn = _simulate_evaluation
         print("Dry run mode: using simulated evaluation results.")
     else:
-        evaluate_fn = _evaluate_with_controller
+        async def _evaluate_live(candidate: Dict[str, Any], minibatch: List[EvaluationCase]):
+            return await runner.evaluate_prompt(candidate["system_prompt"], minibatch)
+
+        evaluate_fn = _evaluate_live
         print("Running live evaluation; ensure LLM and PageIndex credentials are configured.")
 
     adapter = ReActControllerAdapter(
@@ -143,33 +121,6 @@ async def main() -> None:
         print(f"Optimization complete. Aggregate score={result.metrics.aggregate_score:.3f}")
     else:
         print("Optimization aborted: no result produced.")
-
-
-def _load_dataset(path: Path) -> List[EvaluationCase]:
-    """Load case fixtures and convert them to CaseBundle objects."""
-    entries: List[EvaluationCase] = []
-
-    def _add_entry(data: Dict[str, Any], source: str) -> None:
-        case_bundle, policy_doc_id = case_dict_to_case_bundle(data)
-        entries.append(EvaluationCase(case_bundle=case_bundle, policy_document_id=policy_doc_id, source=source))
-
-    if path.is_dir():
-        for file in sorted(path.glob("*.json")):
-            _add_entry(json.loads(file.read_text()), str(file))
-    elif path.is_file():
-        payload = json.loads(path.read_text())
-        if isinstance(payload, list):
-            for idx, case in enumerate(payload):
-                _add_entry(case, f"{path}:{idx}")
-        elif "cases" in payload:
-            for idx, case in enumerate(payload["cases"]):
-                _add_entry(case, f"{path}:{idx}")
-        else:
-            _add_entry(payload, str(path))
-    else:
-        raise SystemExit(f"No dataset found at {path}")
-
-    return entries
 
 
 def _synthetic_result(case_bundle: CaseBundle) -> CriterionResult:

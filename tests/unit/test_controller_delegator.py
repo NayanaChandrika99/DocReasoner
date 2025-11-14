@@ -15,6 +15,8 @@ from reasoning_service.models.schema import (
 )
 from reasoning_service.services import controller as controller_module
 from reasoning_service.services.controller import ReActController
+from reasoning_service.services.prompt_registry import PromptRegistry
+from reasoning_service.prompts.react_system_prompt import REACT_SYSTEM_PROMPT
 
 
 def _case_bundle():
@@ -54,6 +56,7 @@ async def test_delegator_defaults_to_heuristic(monkeypatch):
     monkeypatch.setattr(controller_module.settings, "react_use_llm_controller", False)
     monkeypatch.setattr(controller_module.settings, "react_shadow_mode", False)
     monkeypatch.setattr(controller_module.settings, "react_ab_test_ratio", 0.0)
+    monkeypatch.setattr(controller_module.settings, "prompt_ab_test_ratio", 0.0)
 
     retrieval_service = AsyncMock()
     controller = ReActController(retrieval_service=retrieval_service)
@@ -86,6 +89,7 @@ async def test_delegator_falls_back_when_llm_fails(monkeypatch):
     monkeypatch.setattr(controller_module.settings, "react_shadow_mode", False)
     monkeypatch.setattr(controller_module.settings, "react_ab_test_ratio", 0.0)
     monkeypatch.setattr(controller_module.settings, "react_fallback_enabled", True)
+    monkeypatch.setattr(controller_module.settings, "prompt_ab_test_ratio", 0.0)
 
     retrieval_service = AsyncMock()
     controller = ReActController(retrieval_service=retrieval_service)
@@ -93,3 +97,75 @@ async def test_delegator_falls_back_when_llm_fails(monkeypatch):
     results = await controller.evaluate_case(_case_bundle(), policy_document_id="doc-123")
 
     assert results[0].status == DecisionStatus.UNCERTAIN
+
+
+@pytest.mark.asyncio
+async def test_llm_prompt_uses_registry_when_ratio_zero(monkeypatch, tmp_path):
+    monkeypatch.setattr(controller_module.settings, "react_use_llm_controller", True)
+    monkeypatch.setattr(controller_module.settings, "react_shadow_mode", False)
+    monkeypatch.setattr(controller_module.settings, "react_ab_test_ratio", 0.0)
+    monkeypatch.setattr(controller_module.settings, "prompt_ab_test_ratio", 0.0)
+
+    registry = PromptRegistry(path=tmp_path / "prompts.json")
+    registry.add_version(prompt_text="OPTIMIZED PROMPT")
+
+    class CapturingLLM:
+        def __init__(self, *args, **kwargs):
+            self.system_prompt = kwargs.get("system_prompt")
+            self.prompt_version = "baseline"
+            self.captured: List[str] = []
+
+        async def evaluate_case(self, *args, **kwargs):
+            self.captured.append(self.system_prompt)
+            return [_criterion_result(DecisionStatus.MET)]
+
+    monkeypatch.setattr(controller_module, "LLMReActController", CapturingLLM)
+    retrieval_service = AsyncMock()
+    controller = ReActController(
+        retrieval_service=retrieval_service,
+        prompt_registry=registry,
+    )
+
+    await controller.evaluate_case(_case_bundle(), policy_document_id="doc-123")
+
+    assert controller._llm_controller.captured[-1] == "OPTIMIZED PROMPT"  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_prompt_ab_ratio_allows_baseline(monkeypatch, tmp_path):
+    monkeypatch.setattr(controller_module.settings, "react_use_llm_controller", True)
+    monkeypatch.setattr(controller_module.settings, "react_shadow_mode", False)
+    monkeypatch.setattr(controller_module.settings, "react_ab_test_ratio", 0.0)
+    monkeypatch.setattr(controller_module.settings, "prompt_ab_test_ratio", 0.5)
+
+    registry = PromptRegistry(path=tmp_path / "prompts.json")
+    registry.add_version(prompt_text="OPTIMIZED PROMPT")
+
+    class CapturingLLM:
+        def __init__(self, *args, **kwargs):
+            self.system_prompt = kwargs.get("system_prompt")
+            self.prompt_version = "baseline"
+            self.captured: List[str] = []
+
+        async def evaluate_case(self, *args, **kwargs):
+            self.captured.append(self.system_prompt)
+            return [_criterion_result(DecisionStatus.MET)]
+
+    class FixedRandom:
+        def __init__(self, value: float):
+            self.value = value
+
+        def random(self) -> float:
+            return self.value
+
+    monkeypatch.setattr(controller_module, "LLMReActController", CapturingLLM)
+    retrieval_service = AsyncMock()
+    controller = ReActController(
+        retrieval_service=retrieval_service,
+        prompt_registry=registry,
+    )
+    controller._rng = FixedRandom(0.99)  # Force baseline selection
+
+    await controller.evaluate_case(_case_bundle(), policy_document_id="doc-123")
+
+    assert controller._llm_controller.captured[-1] == REACT_SYSTEM_PROMPT  # type: ignore[attr-defined]

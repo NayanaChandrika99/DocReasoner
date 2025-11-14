@@ -11,6 +11,8 @@ from typing import Any, Dict, List, Optional
 
 from policy_ingest.pageindex_client import PageIndexClient, PageIndexError
 from reasoning_service.config import settings
+from reasoning_service.services.treestore_client import TreeStoreClient, TreeStoreNode
+from reasoning_service.utils.error_codes import ReasonCode
 from retrieval.fts5_fallback import FTS5Fallback
 
 logger = logging.getLogger(__name__)
@@ -174,3 +176,79 @@ class RetrievalService:
             for idx, content, _score in hits:
                 tightened.append(Span(node_id=ref.node_id, page_index=None, text=content))
         return tightened
+
+
+class TreeStoreRetrievalService:
+    """Retrieval adapter backed by TreeStore search APIs."""
+
+    def __init__(self, client: TreeStoreClient) -> None:
+        self.client = client
+
+    def search(
+        self,
+        query: str,
+        policy_id: str,
+        version_id: Optional[str],
+        top_k: int,
+    ) -> RetrievalResult:
+        resolved_version, nodes = self.client.search_nodes(
+            policy_id=policy_id,
+            query=query,
+            version_id=version_id,
+            top_k=top_k,
+        )
+        if not nodes:
+            return RetrievalResult.empty(
+                reason_code=ReasonCode.TREESTORE_NO_NODES,
+                error=f"No TreeStore nodes found for {policy_id}",
+            )
+
+        node_refs: List[NodeReference] = []
+        spans: List[Span] = []
+        for node in nodes:
+            node_refs.append(
+                NodeReference(
+                    node_id=node.node_id,
+                    pages=node.pages,
+                    title=node.title,
+                    summary=node.summary,
+                )
+            )
+            preview = self._preview_text(node)
+            if preview:
+                spans.append(Span(node_id=node.node_id, page_index=None, text=preview))
+
+        trajectory = self._build_trajectory(nodes[0], policy_id, resolved_version)
+        return RetrievalResult(
+            node_refs=node_refs,
+            spans=spans,
+            search_trajectory=trajectory,
+            retrieval_method="treestore",
+            confidence=0.85,
+            reason_code=None,
+        )
+
+    @staticmethod
+    def _preview_text(node: TreeStoreNode) -> str:
+        if node.summary:
+            return node.summary
+        if node.text:
+            snippet = node.text.split("\n\n", 1)[0]
+            return snippet[:400]
+        return ""
+
+    def _build_trajectory(
+        self,
+        node: TreeStoreNode,
+        policy_id: str,
+        version_id: Optional[str],
+    ) -> List[str]:
+        path: List[str] = []
+        current: Optional[TreeStoreNode] = node
+        while current:
+            label = current.title or current.node_id
+            path.append(label)
+            if not current.parent_id:
+                break
+            current = self.client.get_node(policy_id, version_id, current.parent_id)
+        return list(reversed(path))

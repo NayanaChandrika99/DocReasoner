@@ -11,6 +11,8 @@ from reasoning_service.services.prompt_optimizer import (
     ReActControllerAdapter,
 )
 from reasoning_service.services.react_optimizer import ReActOptimizerService
+from reasoning_service.services.treestore_client import TreeStoreClient
+from reasoning_service.services.pubmed import PubMedClient, PubMedCache
 
 __all__ = [
     "PageIndexClient",
@@ -23,4 +25,7 @@ __all__ = [
     "ReActControllerAdapter",
     "OptimizationConfig",
     "ReActOptimizerService",
+    "TreeStoreClient",
+    "PubMedClient",
+    "PubMedCache",
 ]

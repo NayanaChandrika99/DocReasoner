@@ -2,6 +2,7 @@
 
 from fastapi.testclient import TestClient
 import pytest
+from fastapi import HTTPException
 
 from reasoning_service.api.app import create_app
 from reasoning_service.api.routes import reason
@@ -92,3 +93,57 @@ def test_auth_review_route_returns_stubbed_result(monkeypatch):
     data = response.json()
     assert data["results"][0]["status"] == "met"
     assert data["results"][0]["rationale"] == "stub rationale"
+
+
+def test_auth_review_returns_504_on_timeout(monkeypatch):
+    class TimeoutController(StubController):
+        async def evaluate_case(self, *args, **kwargs):
+            raise TimeoutError("PageIndex timeout")
+
+    app = create_app()
+    app.dependency_overrides[reason.get_controller] = lambda: TimeoutController()
+    app.dependency_overrides[reason.get_db] = _override_db
+    app.dependency_overrides[reason.get_safety_service] = _override_safety
+
+    async def fake_policy(*_args, **_kwargs):
+        return "doc-123", "v1"
+
+    monkeypatch.setattr(reason, "get_policy_document_id", fake_policy)
+
+    client = TestClient(app)
+    payload = {
+        "case_bundle": {
+            "case_id": "case-timeout",
+            "policy_id": "LCD-L34220",
+            "fields": [],
+            "metadata": {},
+        }
+    }
+    response = client.post("/reason/auth-review", json=payload)
+    app.dependency_overrides.clear()
+    assert response.status_code == 504
+
+
+def test_auth_review_returns_404_when_policy_missing(monkeypatch):
+    app = create_app()
+    app.dependency_overrides[reason.get_controller] = lambda: _override_controller()
+    app.dependency_overrides[reason.get_db] = _override_db
+    app.dependency_overrides[reason.get_safety_service] = _override_safety
+
+    async def missing_policy(*_args, **_kwargs):
+        raise HTTPException(status_code=404, detail="Policy missing")
+
+    monkeypatch.setattr(reason, "get_policy_document_id", missing_policy)
+
+    client = TestClient(app)
+    payload = {
+        "case_bundle": {
+            "case_id": "case-missing",
+            "policy_id": "LCD-UNKNOWN",
+            "fields": [],
+            "metadata": {},
+        }
+    }
+    response = client.post("/reason/auth-review", json=payload)
+    app.dependency_overrides.clear()
+    assert response.status_code == 404

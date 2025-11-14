@@ -5,7 +5,7 @@ from __future__ import annotations
 import random
 import time
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from retrieval.service import RetrievalResult
 
@@ -15,7 +15,10 @@ from reasoning_service.observability.react_metrics import (
     record_evaluation,
     record_fallback,
 )
+from reasoning_service.prompts.react_system_prompt import REACT_SYSTEM_PROMPT
+from reasoning_service.services.prompt_registry import PromptRegistry
 from reasoning_service.services.react_controller import ReActController as LLMReActController
+from reasoning_service.services.treestore_client import TreeStoreClient
 from reasoning_service.models.schema import (
     CaseBundle,
     ConfidenceBreakdown,
@@ -423,19 +426,33 @@ class ReActController:
         retrieval_service: Any,
         llm_client: Optional[Any] = None,
         fts5_service: Optional[Any] = None,
+        treestore_client: Optional[TreeStoreClient] = None,
+        prompt_registry: Optional[PromptRegistry] = None,
     ):
         self.logger = get_logger(__name__)
         self.retrieval_service = retrieval_service
         self._heuristic = HeuristicReActController(retrieval_service=retrieval_service)
         self._llm_client = llm_client
         self._fts5_service = fts5_service
+        self._treestore_client = treestore_client
+        self.prompt_registry = prompt_registry or PromptRegistry()
         self._llm_controller: Optional[LLMReActController] = None
         self._llm_init_error: Optional[str] = None
         self.shadow_mode = settings.react_shadow_mode
         self.use_llm = settings.react_use_llm_controller
         self.fallback_enabled = settings.react_fallback_enabled
         self.ab_ratio = settings.react_ab_test_ratio
+        self.prompt_ab_ratio = max(0.0, min(1.0, settings.prompt_ab_test_ratio))
+        self.base_system_prompt = REACT_SYSTEM_PROMPT
+        self._active_prompt_version: Optional[str] = None
         self._rng = random.Random()
+        try:
+            self.prompt_registry.load()
+        except Exception as exc:  # noqa: BLE001
+            self.logger.debug(
+                "prompt_registry_load_failed",
+                extra={"error": str(exc)},
+            )
 
         if self._llm_requested():
             self._initialize_llm_controller()
@@ -499,6 +516,8 @@ class ReActController:
                 llm_client=self._llm_client,
                 retrieval_service=self.retrieval_service,
                 fts5_service=self._fts5_service,
+                treestore_client=self._treestore_client,
+                system_prompt=self.base_system_prompt,
             )
             self._llm_init_error = None
         except Exception as exc:
@@ -549,6 +568,8 @@ class ReActController:
     ) -> List[CriterionResult]:
         if not self._llm_controller:
             raise RuntimeError("LLM controller unavailable")
+        prompt_text, prompt_version = self._choose_prompt_text()
+        self._apply_prompt_variant(prompt_text, prompt_version)
         start = time.time()
         results = await self._llm_controller.evaluate_case(case_bundle, policy_document_id)
         self._record_metrics("llm", mode, results, start)
@@ -572,6 +593,30 @@ class ReActController:
             )
             record_fallback("shadow_llm_error")
             return None
+
+    def _choose_prompt_text(self) -> Tuple[str, Optional[str]]:
+        latest = None
+        try:
+            latest = self.prompt_registry.latest()
+        except Exception as exc:  # noqa: BLE001
+            self.logger.debug(
+                "prompt_registry_latest_failed",
+                extra={"error": str(exc)},
+            )
+        if not latest:
+            return self.base_system_prompt, None
+        if self.prompt_ab_ratio <= 0.0:
+            return latest.prompt_text, latest.version_id
+        if self._rng.random() < self.prompt_ab_ratio:
+            return latest.prompt_text, latest.version_id
+        return self.base_system_prompt, None
+
+    def _apply_prompt_variant(self, prompt_text: str, prompt_version: Optional[str]) -> None:
+        if not self._llm_controller:
+            return
+        self._llm_controller.system_prompt = prompt_text
+        self._llm_controller.prompt_version = prompt_version or "baseline"
+        self._active_prompt_version = prompt_version
 
     def _record_metrics(
         self,

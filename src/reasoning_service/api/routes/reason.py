@@ -13,9 +13,10 @@ from reasoning_service.models.schema import (
     QAResponse,
 )
 from reasoning_service.models.policy import PolicyVersion, ReasoningOutput
-from reasoning_service.config import get_db
+from reasoning_service.config import get_db, settings
 from policy_ingest.pageindex_client import PageIndexClient
 from reasoning_service.services import RetrievalService, ReActController, SafetyService
+from reasoning_service.services.treestore_client import TreeStoreClient
 
 router = APIRouter()
 
@@ -52,7 +53,12 @@ async def load_calibration_scores(
 async def get_retrieval_service() -> RetrievalService:
     """Get retrieval service instance."""
     pageindex = PageIndexClient()
-    service = RetrievalService(pageindex_client=pageindex)
+    treestore = TreeStoreClient()
+    service = RetrievalService(
+        pageindex_client=pageindex,
+        treestore_client=treestore,
+        backend=settings.retrieval_backend,
+    )
     try:
         yield service
     finally:
