@@ -9,7 +9,10 @@ from policy_ingest.pageindex_client import PageIndexClient
 from retrieval.service import RetrievalService as CoreRetrievalService
 from retrieval.service import TreeStoreRetrievalService
 from reasoning_service.config import settings
-from reasoning_service.services.treestore_client import TreeStoreClient
+from reasoning_service.services.treestore_client import (
+    TreeStoreClientProtocol,
+    create_treestore_client
+)
 
 
 class RetrievalService:
@@ -18,12 +21,21 @@ class RetrievalService:
     def __init__(
         self,
         pageindex_client: Optional[PageIndexClient] = None,
-        treestore_client: Optional[TreeStoreClient] = None,
+        treestore_client: Optional[TreeStoreClientProtocol] = None,
         backend: Optional[str] = None,
     ) -> None:
         self.backend = (backend or settings.retrieval_backend).lower()
         if self.backend == "treestore":
-            self._treestore_client = treestore_client or TreeStoreClient()
+            # Use factory to create appropriate client (stub or gRPC)
+            self._treestore_client = treestore_client or create_treestore_client(
+                use_stub=settings.treestore_use_stub,
+                host=settings.treestore_host,
+                port=settings.treestore_port,
+                timeout=settings.treestore_timeout,
+                max_retries=settings.treestore_max_retries,
+                retry_delay=settings.treestore_retry_delay,
+                enable_compression=settings.treestore_enable_compression,
+            )
             self._core = TreeStoreRetrievalService(client=self._treestore_client)
         else:
             self._client = pageindex_client or PageIndexClient()

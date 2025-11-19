@@ -1,5 +1,6 @@
 # ABOUTME: Provides the TreeStoreClient abstraction for policy version lookups.
 # ABOUTME: Enables TreeStore-backed tools such as temporal lookup and policy xref.
+# ABOUTME: Supports both in-memory stub (for development) and gRPC client (for production).
 """TreeStore client abstractions."""
 
 from __future__ import annotations
@@ -7,7 +8,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date, datetime
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Protocol
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -38,7 +42,49 @@ class TreeStoreClientError(RuntimeError):
     """Raised when TreeStore calls fail."""
 
 
-class TreeStoreClient:
+class TreeStoreClientProtocol(Protocol):
+    """Protocol defining the TreeStore client interface."""
+
+    def get_version_as_of(self, policy_id: str, as_of_date: str) -> TreeStoreVersion:
+        ...
+
+    def get_nodes(self, policy_id: str, version_id: str, node_ids: List[str]) -> Dict[str, TreeStoreNode]:
+        ...
+
+    def find_related_nodes(
+        self,
+        policy_id: str,
+        version_id: Optional[str],
+        criterion_id: str,
+        tokens: List[str],
+        limit: int = 5,
+    ) -> List[Tuple[TreeStoreNode, str]]:
+        ...
+
+    def latest_version(self, policy_id: str) -> Optional[TreeStoreVersion]:
+        ...
+
+    def get_node(
+        self,
+        policy_id: str,
+        version_id: Optional[str],
+        node_id: str,
+    ) -> Optional[TreeStoreNode]:
+        ...
+
+    def search_nodes(
+        self,
+        policy_id: str,
+        query: str,
+        version_id: Optional[str],
+        top_k: int = 3,
+    ) -> Tuple[Optional[str], List[TreeStoreNode]]:
+        ...
+
+
+class TreeStoreClientStub:
+    """In-memory stub implementation for development and testing."""
+
     def __init__(
         self,
         version_catalog: Optional[Dict[str, List[TreeStoreVersion]]] = None,
@@ -273,6 +319,262 @@ class TreeStoreClient:
         return None, {}
 
 
+class TreeStoreClientGRPC:
+    """gRPC-based TreeStore client for production use."""
+
+    def __init__(
+        self,
+        host: str = "localhost",
+        port: int = 50051,
+        timeout: int = 30,
+        max_retries: int = 3,
+        retry_delay: float = 1.0,
+        enable_compression: bool = True,
+    ):
+        """
+        Initialize gRPC TreeStore client.
+
+        Args:
+            host: TreeStore server hostname
+            port: TreeStore server port
+            timeout: Request timeout in seconds
+            max_retries: Maximum number of retry attempts
+            retry_delay: Delay between retries in seconds
+            enable_compression: Enable gRPC compression
+        """
+        try:
+            # Import gRPC client from tree_db/client/python
+            # This needs to be in the Python path
+            import sys
+            import os
+            tree_db_client_path = os.path.join(
+                os.path.dirname(__file__),
+                "..", "..", "..", "tree_db", "client", "python"
+            )
+            sys.path.insert(0, os.path.abspath(tree_db_client_path))
+            from treestore.client import TreeStoreClient as GRPCClient
+
+            self._grpc_client = GRPCClient(host=host, port=port)
+            self.timeout = timeout
+            self.max_retries = max_retries
+            self.retry_delay = retry_delay
+            logger.info(f"Connected to TreeStore gRPC server at {host}:{port}")
+        except Exception as e:
+            logger.error(f"Failed to initialize gRPC client: {e}")
+            raise TreeStoreClientError(f"gRPC client initialization failed: {e}") from e
+
+    def _dict_to_node(self, node_dict: dict) -> TreeStoreNode:
+        """Convert gRPC node dict to TreeStoreNode."""
+        return TreeStoreNode(
+            node_id=node_dict.get("node_id", ""),
+            title=node_dict.get("title"),
+            section_path=node_dict.get("section_path"),
+            pages=list(range(
+                node_dict.get("page_start", 0),
+                node_dict.get("page_end", 0) + 1
+            )),
+            summary=node_dict.get("summary"),
+            parent_id=node_dict.get("parent_id") or None,
+            keywords=[],  # TODO: Add keywords field to protobuf
+            see_also=[],  # TODO: Add see_also field to protobuf
+            text=node_dict.get("text"),
+        )
+
+    def get_version_as_of(self, policy_id: str, as_of_date: str) -> TreeStoreVersion:
+        """Return the version that was active on the given date."""
+        try:
+            response = self._grpc_client.get_version_as_of(
+                policy_id=policy_id,
+                as_of_date=as_of_date
+            )
+            if not response or not response.get("version"):
+                raise TreeStoreClientError(
+                    f"No version found for {policy_id} on {as_of_date}"
+                )
+
+            version_data = response["version"]
+            return TreeStoreVersion(
+                policy_id=version_data.get("policy_id", policy_id),
+                version_id=version_data.get("version_id", ""),
+                effective_start=version_data.get("effective_start"),
+                effective_end=version_data.get("effective_end"),
+                pageindex_doc_id=version_data.get("pageindex_doc_id"),
+                previous_version_id=version_data.get("previous_version_id"),
+            )
+        except Exception as e:
+            logger.error(f"get_version_as_of failed: {e}")
+            raise TreeStoreClientError(f"Failed to get version: {e}") from e
+
+    def get_nodes(self, policy_id: str, version_id: str, node_ids: List[str]) -> Dict[str, TreeStoreNode]:
+        """Return nodes by id for a specific policy/version pair."""
+        try:
+            # Get all nodes for the policy (gRPC API doesn't have batch get by IDs)
+            # So we fetch the document and filter
+            doc_response = self._grpc_client.get_document(policy_id=policy_id)
+            nodes_dict = {}
+
+            for node_dict in doc_response.get("nodes", []):
+                node = self._dict_to_node(node_dict)
+                if not node_ids or node.node_id in node_ids:
+                    nodes_dict[node.node_id] = node
+
+            if not nodes_dict:
+                raise TreeStoreClientError(
+                    f"No nodes found for policy {policy_id}"
+                )
+
+            return nodes_dict
+        except Exception as e:
+            logger.error(f"get_nodes failed: {e}")
+            raise TreeStoreClientError(f"Failed to get nodes: {e}") from e
+
+    def find_related_nodes(
+        self,
+        policy_id: str,
+        version_id: Optional[str],
+        criterion_id: str,
+        tokens: List[str],
+        limit: int = 5,
+    ) -> List[Tuple[TreeStoreNode, str]]:
+        """Return related nodes with reasons using keyword search."""
+        try:
+            # Use search API to find related nodes
+            query = " ".join(tokens)
+            results = self._grpc_client.search(
+                policy_id=policy_id,
+                query=query,
+                limit=limit
+            )
+
+            related_nodes = []
+            for result in results:
+                node = self._dict_to_node(result["node"])
+                reason = "keyword"  # Search is keyword-based
+                related_nodes.append((node, reason))
+
+            return related_nodes
+        except Exception as e:
+            logger.warning(f"find_related_nodes failed, returning empty: {e}")
+            return []
+
+    def latest_version(self, policy_id: str) -> Optional[TreeStoreVersion]:
+        """Return the latest known version for a policy."""
+        try:
+            versions = self._grpc_client.list_versions(policy_id=policy_id)
+            if not versions or not versions.get("versions"):
+                return None
+
+            # Get the last version (should be latest)
+            latest = versions["versions"][-1]
+            return TreeStoreVersion(
+                policy_id=policy_id,
+                version_id=latest.get("version_id", ""),
+                effective_start=latest.get("effective_start"),
+                effective_end=latest.get("effective_end"),
+                pageindex_doc_id=latest.get("pageindex_doc_id"),
+                previous_version_id=latest.get("previous_version_id"),
+            )
+        except Exception as e:
+            logger.warning(f"latest_version failed: {e}")
+            return None
+
+    def get_node(
+        self,
+        policy_id: str,
+        version_id: Optional[str],
+        node_id: str,
+    ) -> Optional[TreeStoreNode]:
+        """Get a single node by ID."""
+        try:
+            response = self._grpc_client.get_node(
+                policy_id=policy_id,
+                node_id=node_id
+            )
+            if not response or not response.get("node"):
+                return None
+
+            return self._dict_to_node(response["node"])
+        except Exception as e:
+            logger.warning(f"get_node failed: {e}")
+            return None
+
+    def search_nodes(
+        self,
+        policy_id: str,
+        query: str,
+        version_id: Optional[str],
+        top_k: int = 3,
+    ) -> Tuple[Optional[str], List[TreeStoreNode]]:
+        """Search nodes by keyword relevance."""
+        try:
+            results = self._grpc_client.search(
+                policy_id=policy_id,
+                query=query,
+                limit=top_k
+            )
+
+            nodes = [self._dict_to_node(result["node"]) for result in results]
+            return version_id, nodes
+        except Exception as e:
+            logger.warning(f"search_nodes failed: {e}")
+            return version_id, []
+
+    def close(self):
+        """Close the gRPC connection."""
+        if hasattr(self, "_grpc_client"):
+            self._grpc_client.close()
+
+
+def create_treestore_client(
+    use_stub: bool = False,
+    host: str = "localhost",
+    port: int = 50051,
+    timeout: int = 30,
+    max_retries: int = 3,
+    retry_delay: float = 1.0,
+    enable_compression: bool = True,
+    # Stub-specific parameters
+    version_catalog: Optional[Dict[str, List[TreeStoreVersion]]] = None,
+    node_store: Optional[Dict[Tuple[str, str], Dict[str, TreeStoreNode]]] = None,
+    cross_reference_index: Optional[Dict[Tuple[str, str], List[TreeStoreNode]]] = None,
+) -> TreeStoreClientProtocol:
+    """
+    Factory function to create the appropriate TreeStore client.
+
+    Args:
+        use_stub: If True, use in-memory stub; otherwise use gRPC client
+        host: gRPC server host (used if use_stub=False)
+        port: gRPC server port (used if use_stub=False)
+        timeout: Request timeout in seconds
+        max_retries: Maximum retry attempts
+        retry_delay: Delay between retries
+        enable_compression: Enable gRPC compression
+        version_catalog: Version catalog for stub
+        node_store: Node store for stub
+        cross_reference_index: Cross-reference index for stub
+
+    Returns:
+        TreeStoreClient implementation (stub or gRPC)
+    """
+    if use_stub:
+        logger.info("Using TreeStore stub (in-memory)")
+        return TreeStoreClientStub(
+            version_catalog=version_catalog,
+            node_store=node_store,
+            cross_reference_index=cross_reference_index,
+        )
+    else:
+        logger.info(f"Using TreeStore gRPC client at {host}:{port}")
+        return TreeStoreClientGRPC(
+            host=host,
+            port=port,
+            timeout=timeout,
+            max_retries=max_retries,
+            retry_delay=retry_delay,
+            enable_compression=enable_compression,
+        )
+
+
 def _parse_date(value: Optional[str]) -> Optional[date]:
     if value in (None, ""):
         return None
@@ -280,3 +582,7 @@ def _parse_date(value: Optional[str]) -> Optional[date]:
         return datetime.fromisoformat(value).date()
     except ValueError as exc:
         raise TreeStoreClientError(f"Invalid date value: {value}") from exc
+
+
+# Backward compatibility: Keep TreeStoreClient as alias to stub for now
+TreeStoreClient = TreeStoreClientStub

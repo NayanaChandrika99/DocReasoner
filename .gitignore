@@ -122,3 +122,25 @@ logs/
 # Data directories
 data/
 backups/
+
+# Planning and agent docs (keep local only)
+AGENTS.md
+openspec/AGENTS.md
+.agent/
+.claude/
+plan/
+old_plan.md
+docs/plan.md
+GEMINI.md
+COMPLETENESS.md
+PROJECT_COMPLETENESS_REPORT_*.md
+journal.md
+tree_db/*PLAN*.md
+
+# Markdown docs (only keep allowlisted ones tracked)
+*.md
+!README.md
+!tree_db/DEPLOYMENT.md
+!tree_db/GETTING_STARTED.md
+!tree_db/README.md
+!tree_db/PERFORMANCE.md

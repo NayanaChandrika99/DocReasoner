@@ -41,6 +41,29 @@ class Settings(BaseSettings):
     pageindex_base_url: str = "https://api.pageindex.ai"
     pageindex_timeout: int = 30
 
+    # TreeStore gRPC
+    treestore_host: str = Field(
+        default="localhost", description="TreeStore gRPC server host"
+    )
+    treestore_port: int = Field(
+        default=50051, description="TreeStore gRPC server port"
+    )
+    treestore_timeout: int = Field(
+        default=30, description="TreeStore gRPC timeout in seconds"
+    )
+    treestore_max_retries: int = Field(
+        default=3, description="Max retries for TreeStore gRPC calls"
+    )
+    treestore_retry_delay: float = Field(
+        default=1.0, description="Delay between retries in seconds"
+    )
+    treestore_enable_compression: bool = Field(
+        default=True, description="Enable gRPC compression"
+    )
+    treestore_use_stub: bool = Field(
+        default=False, description="Use in-memory stub instead of gRPC client (for development)"
+    )
+
     # Retrieval Settings
     llm_tree_search_enabled: bool = True
     hybrid_tree_search_threshold: float = 0.15  # Switch to hybrid if ambiguity > 15%

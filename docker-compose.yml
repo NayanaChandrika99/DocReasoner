@@ -8,11 +8,15 @@ services:
     environment:
       - DATABASE_URL=postgresql://postgres:password@db:5432/reasoning_service
       - REDIS_URL=redis://redis:6379/0
+      - TREESTORE_HOST=tree_db
+      - TREESTORE_PORT=50051
+      - RETRIEVAL_BACKEND=treestore
     env_file:
       - .env
     depends_on:
       - db
       - redis
+      - tree_db
     volumes:
       - ./src:/app/src
     command: uvicorn reasoning_service.api.app:create_app --factory --host 0.0.0.0 --port 8000 --reload
@@ -35,6 +39,29 @@ services:
     volumes:
       - redis_data:/data
 
+  tree_db:
+    build:
+      context: ./tree_db
+      dockerfile: Dockerfile
+    ports:
+      - "50051:50051"  # gRPC
+      - "9090:9090"    # Prometheus metrics
+    environment:
+      - GRPC_PORT=50051
+      - METRICS_PORT=9090
+      - DB_PATH=/data/treestore.db
+      - LOG_LEVEL=info
+      - LOG_PRETTY=false
+    volumes:
+      - treestore_data:/data
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9090/health"]
+      interval: 30s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+
 volumes:
   postgres_data:
   redis_data:
+  treestore_data:

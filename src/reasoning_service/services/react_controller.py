@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import time
 from typing import List, Dict, Any, Optional
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from reasoning_service.services.llm_client import LLMClient, LLMClientError
 from reasoning_service.services.tools import get_tool_definitions
@@ -23,6 +24,7 @@ from reasoning_service.models.schema import (
     ReasoningStep,
     RetrievalMethod,
 )
+from reasoning_service.models.policy import ReasoningOutput
 from reasoning_service.config import settings
 from reasoning_service.utils.logging import get_logger
 
@@ -41,6 +43,7 @@ class ReActController:
         treestore_client: Optional[TreeStoreClient] = None,
         pubmed_client: Optional[PubMedClient] = None,
         pubmed_cache: Optional[PubMedCache] = None,
+        session_maker: Optional[async_sessionmaker] = None,
     ):
         """Initialize ReAct controller.
 
@@ -50,6 +53,7 @@ class ReActController:
             fts5_service: Optional FTS5Fallback service
             max_iterations: Maximum ReAct loop iterations (default from config)
             verbose: Enable verbose logging
+            session_maker: Async database session maker for telemetry
         """
         self.llm = llm_client or LLMClient()
         self.retrieval_service = retrieval_service
@@ -57,6 +61,7 @@ class ReActController:
         self.treestore_client = treestore_client
         self.pubmed_client = pubmed_client
         self.pubmed_cache = pubmed_cache
+        self.session_maker = session_maker
         self.max_iterations = max_iterations or settings.controller_max_iterations
         self.verbose = verbose
         self.tools = get_tool_definitions()
@@ -445,12 +450,10 @@ Begin your analysis now.
             ],
         )
         record_confidence_score(confidence)
-        self._log_decision_event(
+        await self._log_decision_event(
             case_bundle=case_bundle,
             criterion_id=criterion_id,
-            status=result.status.value,
-            confidence=confidence,
-            reason_code=result.reason_code,
+            result=result,
             latency_ms=latency_ms,
             tool_history=tool_history,
         )
@@ -498,12 +501,10 @@ Begin your analysis now.
                 for t in reasoning_trace
             ],
         )
-        self._log_decision_event(
+        await self._log_decision_event(
             case_bundle=case_bundle,
             criterion_id=criterion_id,
-            status=result.status.value,
-            confidence=result.confidence,
-            reason_code=reason_code,
+            result=result,
             latency_ms=latency_ms,
             tool_history=tool_history,
         )
@@ -590,28 +591,64 @@ Begin your analysis now.
                 return json.dumps({"success": False, "error": str(exc)})
         return None
 
-    def _log_decision_event(
+    async def _log_decision_event(
         self,
         case_bundle: CaseBundle,
         criterion_id: str,
-        status: str,
-        confidence: float,
-        reason_code: Optional[str],
+        result: CriterionResult,
         latency_ms: Optional[int],
         tool_history: List[Dict[str, Any]],
     ) -> None:
-        """Emit structured log for downstream observability."""
+        """Emit structured log and write to database for telemetry.
+
+        Args:
+            case_bundle: Case being evaluated
+            criterion_id: Criterion identifier
+            result: Evaluation result with full details
+            latency_ms: Evaluation latency
+            tool_history: Tool call history
+        """
+        # Structured logging (existing behavior)
         extra = {
             "event": "controller_decision",
             "case_id": case_bundle.case_id,
             "policy_id": case_bundle.policy_id,
             "policy_version": case_bundle.metadata.get("policy_version_id"),
             "criterion_id": criterion_id,
-            "status": status,
-            "confidence": confidence,
-            "reason_code": reason_code,
+            "status": result.status.value,
+            "confidence": result.confidence,
+            "reason_code": result.reason_code,
             "latency_ms": latency_ms,
             "tool_sequence": tool_history,
             "prompt_version": self.prompt_version,
         }
         self.logger.info("controller_decision", extra=extra)
+
+        # Database write for telemetry (new behavior)
+        if self.session_maker:
+            try:
+                async with self.session_maker() as session:
+                    reasoning_output = ReasoningOutput(
+                        case_id=case_bundle.case_id,
+                        criterion_id=criterion_id,
+                        policy_id=case_bundle.policy_id,
+                        version_id=case_bundle.metadata.get("policy_version_id", "unknown"),
+                        status=result.status.value,
+                        rationale=result.rationale,
+                        citation_section_path=result.citation.section if result.citation else "N/A",
+                        citation_pages=json.dumps(result.citation.pages if result.citation else []),
+                        c_tree=result.confidence_breakdown.c_tree if result.confidence_breakdown else 0.0,
+                        c_span=result.confidence_breakdown.c_span if result.confidence_breakdown else 0.0,
+                        c_final=result.confidence_breakdown.c_final if result.confidence_breakdown else 0.0,
+                        c_joint=result.confidence_breakdown.c_joint if result.confidence_breakdown else 0.0,
+                        search_trajectory=json.dumps([
+                            {"step": s.step, "action": s.action[:200], "observation": s.observation[:200]}
+                            for s in (result.reasoning_trace or [])
+                        ]),
+                        retrieval_method=result.retrieval_method.value if result.retrieval_method else "unknown",
+                    )
+                    session.add(reasoning_output)
+                    await session.commit()
+            except Exception as e:
+                # Log but don't fail evaluation on database errors
+                self.logger.warning(f"Failed to write telemetry to database: {e}", exc_info=True)
