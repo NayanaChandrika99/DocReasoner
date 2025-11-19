@@ -4,6 +4,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"os"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -769,12 +770,37 @@ func (s *Server) Health(ctx context.Context, req *pb.HealthRequest) (*pb.HealthR
 }
 
 func (s *Server) Stats(ctx context.Context, req *pb.StatsRequest) (*pb.StatsResponse, error) {
-	// Get database stats (simplified - would query actual stats)
+	// Count nodes by scanning with PREFIX_NODE (2000)
+	nodeCount := int64(0)
+	nodePrefix := []byte{0x00, 0x00, 0x07, 0xD0} // PREFIX_NODE = 2000 encoded
+	s.kv.Scan(nodePrefix, func(key, val []byte) bool {
+		if len(key) >= 4 {
+			// Check if key starts with PREFIX_NODE
+			prefix := uint32(key[0])<<24 | uint32(key[1])<<16 | uint32(key[2])<<8 | uint32(key[3])
+			if prefix == 2000 {
+				nodeCount++
+			} else {
+				return false // Stop scanning when we hit different prefix
+			}
+		}
+		return true
+	})
+
+	// Get database file size
+	var dbSize int64
+	if fileInfo, err := os.Stat(s.kv.Path); err == nil {
+		dbSize = fileInfo.Size()
+	}
+
+	// Estimate documents (rough estimate - 1 document per unique policy ID)
+	// For simplicity, we'll use opCounts["StoreDocument"]
+	docCount := s.opCounts["StoreDocument"]
+
 	return &pb.StatsResponse{
-		TotalDocuments:  0,  // Would query from docStore
-		TotalNodes:      0,  // Would query from docStore
-		TotalVersions:   0,  // Would query from verStore
-		DbSizeBytes:     0,  // Would query from kv
+		TotalDocuments:  docCount,
+		TotalNodes:      nodeCount,
+		TotalVersions:   0, // Would need to scan version keys
+		DbSizeBytes:     dbSize,
 		OperationCounts: s.opCounts,
 	}, nil
 }

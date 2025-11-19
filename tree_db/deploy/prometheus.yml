@@ -1,0 +1,24 @@
+# Prometheus Configuration for TreeStore Monitoring
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: 'reasoning-service'
+    environment: 'development'
+
+scrape_configs:
+  # TreeStore gRPC Server Metrics
+  - job_name: 'treestore'
+    static_configs:
+      - targets: ['treestore:9090']
+        labels:
+          service: 'treestore'
+          component: 'grpc-server'
+
+  # Prometheus Self-Monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+        labels:
+          service: 'prometheus'

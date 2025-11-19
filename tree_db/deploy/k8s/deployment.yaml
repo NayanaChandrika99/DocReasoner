@@ -1,0 +1,103 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: treestore
+  namespace: treestore
+  labels:
+    app: treestore
+    version: v1.0.0
+spec:
+  replicas: 1  # Single instance for now (no HA without WAL)
+  strategy:
+    type: Recreate  # Important: ensures only one pod at a time (no concurrent writes)
+  selector:
+    matchLabels:
+      app: treestore
+  template:
+    metadata:
+      labels:
+        app: treestore
+        version: v1.0.0
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+      - name: treestore
+        image: treestore:latest  # Update with your registry
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: grpc
+          containerPort: 50051
+          protocol: TCP
+        - name: metrics
+          containerPort: 9090
+          protocol: TCP
+        env:
+        - name: GRPC_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: treestore-config
+              key: GRPC_PORT
+        - name: METRICS_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: treestore-config
+              key: METRICS_PORT
+        - name: DB_PATH
+          valueFrom:
+            configMapKeyRef:
+              name: treestore-config
+              key: DB_PATH
+        - name: LOG_LEVEL
+          valueFrom:
+            configMapKeyRef:
+              name: treestore-config
+              key: LOG_LEVEL
+        - name: LOG_PRETTY
+          valueFrom:
+            configMapKeyRef:
+              name: treestore-config
+              key: LOG_PRETTY
+        volumeMounts:
+        - name: data
+          mountPath: /data
+        resources:
+          requests:
+            cpu: 500m
+            memory: 512Mi
+          limits:
+            cpu: 2000m
+            memory: 2Gi
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: metrics
+          initialDelaySeconds: 10
+          periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: metrics
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 3
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: false  # Need write access to /data
+          capabilities:
+            drop:
+            - ALL
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: treestore-data
+      securityContext:
+        fsGroup: 1000
+      terminationGracePeriodSeconds: 30

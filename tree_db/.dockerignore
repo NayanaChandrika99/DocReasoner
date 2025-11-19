@@ -1,0 +1,39 @@
+# Git
+.git
+.gitignore
+
+# Build artifacts
+treestore-server
+*.db
+*.log
+
+# Test files
+/tmp
+*.test
+
+# Documentation
+*.md
+docs/
+
+# Examples
+examples/
+client/python/examples/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,42 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: treestore
+  namespace: treestore
+  labels:
+    app: treestore
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "9090"
+spec:
+  type: ClusterIP
+  selector:
+    app: treestore
+  ports:
+  - name: grpc
+    port: 50051
+    targetPort: grpc
+    protocol: TCP
+  - name: metrics
+    port: 9090
+    targetPort: metrics
+    protocol: TCP
+  sessionAffinity: None
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: treestore-headless
+  namespace: treestore
+  labels:
+    app: treestore
+spec:
+  type: ClusterIP
+  clusterIP: None  # Headless service for StatefulSet (future)
+  selector:
+    app: treestore
+  ports:
+  - name: grpc
+    port: 50051
+    targetPort: grpc
+    protocol: TCP

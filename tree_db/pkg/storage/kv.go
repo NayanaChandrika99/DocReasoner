@@ -8,9 +8,12 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/nainya/treestore/pkg/btree"
+	"github.com/nainya/treestore/pkg/wal"
 )
 
 const (
@@ -47,6 +50,15 @@ type KV struct {
 
 	// Error recovery
 	failed bool // Did last update fail?
+
+	// WAL for durability and crash recovery
+	wal *wal.WAL
+
+	// Checkpointer for background checkpointing
+	checkpointer *wal.Checkpointer
+
+	// currentTxnID for transaction tracking
+	currentTxnID uint64
 }
 
 // Open opens or creates a database file
@@ -57,6 +69,13 @@ func (db *KV) Open() error {
 		return err
 	}
 	db.fd = fd
+
+	// Initialize WAL
+	walPath := db.Path + ".wal"
+	db.wal = &wal.WAL{Path: walPath}
+	if err := db.wal.Open(); err != nil {
+		return fmt.Errorf("failed to open WAL: %w", err)
+	}
 
 	// Get file size
 	var stat syscall.Stat_t
@@ -126,11 +145,32 @@ func (db *KV) Open() error {
 		},
 	)
 
+	// Recover from WAL if needed
+	if err := db.recoverFromWAL(); err != nil {
+		return fmt.Errorf("WAL recovery failed: %w", err)
+	}
+
+	// Start checkpointer
+	db.checkpointer = wal.NewCheckpointer(db.wal, db.checkpoint)
+	db.checkpointer.Start()
+
 	return nil
 }
 
 // Close closes the database
 func (db *KV) Close() error {
+	// Stop checkpointer
+	if db.checkpointer != nil {
+		db.checkpointer.Stop()
+	}
+
+	// Close WAL
+	if db.wal != nil {
+		if err := db.wal.Close(); err != nil {
+			return err
+		}
+	}
+
 	// Unmap all chunks
 	for _, chunk := range db.mmap.chunks {
 		if err := syscall.Munmap(chunk); err != nil {
@@ -152,7 +192,42 @@ func (db *KV) Set(key []byte, val []byte) error {
 	// Save current meta state for potential rollback
 	meta := db.saveMeta()
 
-	// Perform B+Tree insert
+	// Get transaction ID
+	txnID := atomic.AddUint64(&db.currentTxnID, 1)
+
+	// Write to WAL FIRST
+	entry := wal.Entry{
+		LSN:       db.wal.NextLSN(),
+		TxnID:     txnID,
+		OpType:    wal.OpInsert,
+		Key:       key,
+		Value:     val,
+		Timestamp: time.Now(),
+	}
+	if err := db.wal.Write(entry); err != nil {
+		return err
+	}
+
+	// Fsync WAL
+	if err := db.wal.Fsync(); err != nil {
+		return err
+	}
+
+	// Write COMMIT marker
+	commitEntry := wal.Entry{
+		LSN:       db.wal.NextLSN(),
+		TxnID:     txnID,
+		OpType:    wal.OpCommit,
+		Timestamp: time.Now(),
+	}
+	if err := db.wal.Write(commitEntry); err != nil {
+		return err
+	}
+	if err := db.wal.Fsync(); err != nil {
+		return err
+	}
+
+	// Now update B+Tree
 	db.tree.Insert(key, val)
 
 	// Two-phase update
@@ -163,6 +238,38 @@ func (db *KV) Set(key []byte, val []byte) error {
 func (db *KV) Del(key []byte) (bool, error) {
 	meta := db.saveMeta()
 
+	txnID := atomic.AddUint64(&db.currentTxnID, 1)
+
+	// Write DELETE to WAL
+	entry := wal.Entry{
+		LSN:       db.wal.NextLSN(),
+		TxnID:     txnID,
+		OpType:    wal.OpDelete,
+		Key:       key,
+		Timestamp: time.Now(),
+	}
+	if err := db.wal.Write(entry); err != nil {
+		return false, err
+	}
+	if err := db.wal.Fsync(); err != nil {
+		return false, err
+	}
+
+	// Write COMMIT
+	commitEntry := wal.Entry{
+		LSN:       db.wal.NextLSN(),
+		TxnID:     txnID,
+		OpType:    wal.OpCommit,
+		Timestamp: time.Now(),
+	}
+	if err := db.wal.Write(commitEntry); err != nil {
+		return false, err
+	}
+	if err := db.wal.Fsync(); err != nil {
+		return false, err
+	}
+
+	// Update tree
 	deleted := db.tree.Delete(key)
 	if !deleted {
 		return false, nil
@@ -318,9 +425,40 @@ func (db *KV) updateOrRevert(meta []byte) error {
 	} else {
 		// Success - all freed pages including newly freed ones are now available
 		db.free.maxSeq = db.free.tailSeq
+
+		// Write checkpoint marker to WAL after successful persist
+		db.writeCheckpointMarker()
 	}
 
 	return err
+}
+
+// writeCheckpointMarker writes a checkpoint entry to WAL
+func (db *KV) writeCheckpointMarker() {
+	if db.wal == nil {
+		return
+	}
+
+	entry := wal.Entry{
+		LSN:       db.wal.NextLSN(),
+		TxnID:     0,
+		OpType:    wal.OpCheckpoint,
+		Timestamp: time.Now(),
+	}
+
+	// Write checkpoint marker
+	// Note: Checkpoint failures are not fatal to the transaction,
+	// but should be logged for monitoring WAL health
+	if err := db.wal.Write(entry); err != nil {
+		// TODO: Add structured logging when logging infrastructure is available
+		fmt.Printf("WARNING: checkpoint marker write failed: %v\n", err)
+		return
+	}
+
+	if err := db.wal.Fsync(); err != nil {
+		// TODO: Add structured logging when logging infrastructure is available
+		fmt.Printf("WARNING: checkpoint marker fsync failed: %v\n", err)
+	}
 }
 
 // updateFile performs the two-phase fsync update
@@ -342,6 +480,27 @@ func (db *KV) updateFile() error {
 
 	// Phase 4: fsync to make meta page durable
 	return syscall.Fsync(db.fd)
+}
+
+// recoverFromWAL replays the WAL to recover from crashes
+func (db *KV) recoverFromWAL() error {
+	recovery := wal.NewRecovery(db.wal)
+
+	return recovery.Recover(func(op wal.OpType, key, value []byte) error {
+		switch op {
+		case wal.OpInsert:
+			db.tree.Insert(key, value)
+		case wal.OpDelete:
+			db.tree.Delete(key)
+		}
+		return nil
+	})
+}
+
+// checkpoint flushes current state to disk
+func (db *KV) checkpoint() error {
+	// Flush current state to disk
+	return db.updateFile()
 }
 
 // writePages writes temporary pages to disk
